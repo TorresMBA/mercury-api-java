@@ -1,0 +1,121 @@
+// Plantilla CI para Spring Boot con Maven. Copiar a la raíz del repo de la app y ajustar APP.
+pipeline {
+  agent none
+
+  options {
+    timestamps()
+    // Un push nuevo cancela el build anterior de este job, aunque esté esperando en "Aprobar prod"
+    disableConcurrentBuilds(abortPrevious: true)
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+  }
+
+  environment {
+    APP = 'mi-app-java' // nombre de imagen y contenedor: minúsculas y guiones
+    TAG = "${BUILD_NUMBER}"
+  }
+
+  stages {
+    stage('CI') {
+      // 'maven' es la versión por defecto. Para fijar otra: 'maven-8', 'maven-11', 'maven-17', 'maven-21' o 'maven-25'.
+      // La imagen de la app se empaqueta con la misma versión que el agente.
+      agent { label 'maven-17' }
+      options {
+        // Un build colgado no debe ocupar un cupo de agente indefinidamente
+        timeout(time: 45, unit: 'MINUTES')
+      }
+      environment {
+        REGISTRY = credentials('registry')
+      }
+      stages {
+        stage('Build y test') {
+          steps {
+            sh 'mvn -B verify'
+          }
+        }
+
+        stage('SonarQube') {
+          steps {
+            withSonarQubeEnv('sonarqube') {
+              // El escáner de Maven necesita Java 17 o superior. Con maven-8 o maven-11 sustituye la línea por:
+              //   sh 'mercury-ci sonar "$APP" -Dsonar.sources=src/main -Dsonar.java.binaries=target/classes'
+              sh 'mvn -B sonar:sonar -Dsonar.projectKey="$APP" -Dsonar.token="$SONAR_AUTH_TOKEN"'
+            }
+          }
+        }
+
+        // La espera del quality gate no consume recursos: los escáneres corren mientras tanto
+        stage('Análisis') {
+          failFast true
+          parallel {
+            stage('Quality gate') {
+              steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                  waitForQualityGate abortPipeline: true
+                }
+              }
+            }
+
+            stage('Seguridad') {
+              steps {
+                sh '''
+                  mercury-ci semgrep
+                  mercury-ci trivy-fs
+                '''
+              }
+            }
+          }
+        }
+
+        stage('Imagen') {
+          steps {
+            sh '''
+              rm -rf release && mkdir release
+              cp target/*.jar release/
+              mercury-ci login
+              mercury-ci package spring release "$APP" "$TAG"
+              mercury-ci trivy-image "$(mercury-ci image-ref "$APP" "$TAG")"
+            '''
+          }
+        }
+
+        stage('Deploy dev') {
+          steps {
+            sh 'mercury-ci deploy "$APP" dev "$TAG"'
+          }
+        }
+      }
+      post {
+        always {
+          // El agente es efímero: sin esto el informe de Semgrep se pierde
+          archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
+        }
+      }
+    }
+
+    // Sin agente: la espera no ocupa RAM ni un cupo de agente
+    stage('Aprobar prod') {
+      steps {
+        timeout(time: 1, unit: 'DAYS') {
+          input message: "¿Promover ${APP}:${TAG} a prod?"
+        }
+      }
+    }
+
+    stage('Deploy prod') {
+      agent { label 'base' }
+      environment {
+        REGISTRY = credentials('registry')
+      }
+      options {
+        skipDefaultCheckout()
+        timeout(time: 10, unit: 'MINUTES')
+      }
+      steps {
+        sh '''
+          mercury-ci login
+          mercury-ci deploy "$APP" prod "$TAG"
+        '''
+      }
+    }
+  }
+}
